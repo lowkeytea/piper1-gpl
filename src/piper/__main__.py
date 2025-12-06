@@ -50,6 +50,7 @@ def main() -> None:
     )
     #
     parser.add_argument("-s", "--speaker", type=int, help="Id of speaker (default: 0)")
+    parser.add_argument("-e", "--emotion", type=int, help="Id of emotion (default: 0)")
     parser.add_argument(
         "--length-scale", "--length_scale", type=float, help="Phoneme length"
     )
@@ -142,6 +143,7 @@ def main() -> None:
     voice = PiperVoice.load(model_path, use_cuda=args.cuda)
     syn_config = SynthesisConfig(
         speaker_id=args.speaker,
+        emotion_id=args.emotion,
         length_scale=args.length_scale,
         noise_scale=args.noise_scale,
         noise_w_scale=args.noise_w_scale,

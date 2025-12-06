@@ -61,7 +61,8 @@ class ModelAudioConfig:
 class ModelConfig:
     num_symbols: int
     n_speakers: int
-    audio: ModelAudioConfig
+    n_emotions: int = 0  # NEW: number of emotion categories (0 = disabled)
+    audio: ModelAudioConfig = field(default_factory=ModelAudioConfig.low_quality)
     mel: MelAudioConfig = field(default_factory=MelAudioConfig)
 
     inter_channels: int = 192
@@ -74,12 +75,18 @@ class ModelConfig:
     n_layers_q: int = 3
     use_spectral_norm: bool = False
     gin_channels: int = 0  # single speaker
+    emo_channels: int = 0  # NEW: emotion embedding channels (0 = auto)
     use_sdp: bool = True  # StochasticDurationPredictor
     segment_size: int = 8192
 
     @property
     def is_multispeaker(self) -> bool:
         return self.n_speakers > 1
+
+    @property
+    def is_multiemotion(self) -> bool:
+        """Whether emotion conditioning is enabled."""
+        return self.n_emotions > 1
 
     @property
     def resblock(self) -> str:
@@ -108,6 +115,10 @@ class ModelConfig:
     def __post_init__(self):
         if self.is_multispeaker and (self.gin_channels == 0):
             self.gin_channels = 512
+
+        # NEW: Auto-set emotion channels if emotions are enabled
+        if self.is_multiemotion and (self.emo_channels == 0):
+            self.emo_channels = 256
 
 
 @dataclass

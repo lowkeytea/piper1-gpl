@@ -14,6 +14,7 @@ class VitsLightningCLI(LightningCLI):
         parser.link_arguments("data.batch_size", "model.batch_size")
         parser.link_arguments("data.num_symbols", "model.num_symbols")
         parser.link_arguments("model.num_speakers", "data.num_speakers")
+        parser.link_arguments("model.num_emotions", "data.num_emotions")  # NEW
         parser.link_arguments("model.sample_rate", "data.sample_rate")
         parser.link_arguments("model.filter_length", "data.filter_length")
         parser.link_arguments("model.hop_length", "data.hop_length")

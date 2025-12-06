@@ -27,6 +27,7 @@ class VitsModel(L.LightningModule):
         sample_rate: int = 22050,
         num_symbols: int = 256,
         num_speakers: int = 1,
+        num_emotions: int = 0,  # NEW: number of emotion categories (0 = disabled)
         # audio
         resblock="2",
         resblock_kernel_sizes=(3, 5, 7),
@@ -56,6 +57,7 @@ class VitsModel(L.LightningModule):
         n_layers_q: int = 3,
         use_spectral_norm: bool = False,
         gin_channels: int = 0,
+        emo_channels: int = 0,  # NEW: emotion embedding channels (0 = auto)
         use_sdp: bool = True,
         segment_size: int = 8192,
         # training
@@ -112,6 +114,10 @@ class VitsModel(L.LightningModule):
             # Default gin_channels for multi-speaker model
             self.hparams.gin_channels = 512
 
+        # NEW: Auto-set emotion channels if emotions are enabled
+        if (self.hparams.num_emotions > 1) and (self.hparams.emo_channels <= 0):
+            self.hparams.emo_channels = 256
+
         # Set up models
         self.model_g = SynthesizerTrn(
             n_vocab=num_symbols,
@@ -131,14 +137,16 @@ class VitsModel(L.LightningModule):
             upsample_initial_channel=self.hparams.upsample_initial_channel,
             upsample_kernel_sizes=self.hparams.upsample_kernel_sizes,
             n_speakers=self.hparams.num_speakers,
+            n_emotions=self.hparams.num_emotions,  # NEW
             gin_channels=self.hparams.gin_channels,
+            emo_channels=self.hparams.emo_channels,  # NEW
             use_sdp=self.hparams.use_sdp,
         )
         self.model_d = MultiPeriodDiscriminator(
             use_spectral_norm=self.hparams.use_spectral_norm
         )
 
-    def forward(self, text, text_lengths, scales, sid=None):
+    def forward(self, text, text_lengths, scales, sid=None, eid=None):  # NEW: added eid
         noise_scale = scales[0]
         length_scale = scales[1]
         noise_scale_w = scales[2]
@@ -149,13 +157,14 @@ class VitsModel(L.LightningModule):
             length_scale=length_scale,
             noise_scale_w=noise_scale_w,
             sid=sid,
+            eid=eid,  # NEW
         )
 
         return audio
 
     def _compute_loss(self, batch: Batch):
         # g step
-        x, x_lengths, y, _, spec, spec_lengths, speaker_ids = (
+        x, x_lengths, y, _, spec, spec_lengths, speaker_ids, emotion_ids = (
             batch.phoneme_ids,
             batch.phoneme_lengths,
             batch.audios,
@@ -163,6 +172,7 @@ class VitsModel(L.LightningModule):
             batch.spectrograms,
             batch.spectrogram_lengths,
             batch.speaker_ids if batch.speaker_ids is not None else None,
+            batch.emotion_ids if batch.emotion_ids is not None else None,  # NEW
         )
         (
             y_hat,
@@ -172,7 +182,7 @@ class VitsModel(L.LightningModule):
             _x_mask,
             z_mask,
             (_z, z_p, m_p, logs_p, _m_q, logs_q),
-        ) = self.model_g(x, x_lengths, spec, spec_lengths, speaker_ids)
+        ) = self.model_g(x, x_lengths, spec, spec_lengths, speaker_ids, emotion_ids)  # NEW: added emotion_ids
 
         mel = spec_to_mel_torch(
             spec,
@@ -273,7 +283,13 @@ class VitsModel(L.LightningModule):
                     if test_utt.speaker_id is not None
                     else None
                 )
-                test_audio = self(text, text_lengths, scales, sid=sid).detach()
+                # NEW: Get emotion_id for test utterance
+                eid = (
+                    test_utt.emotion_id.to(self.device)
+                    if test_utt.emotion_id is not None
+                    else None
+                )
+                test_audio = self(text, text_lengths, scales, sid=sid, eid=eid).detach()  # NEW: added eid
 
                 # Scale to make louder in [-1, 1]
                 test_audio = test_audio * (1.0 / max(0.01, abs(test_audio).max()))

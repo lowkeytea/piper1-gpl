@@ -41,6 +41,9 @@ class PiperConfig:
     speaker_id_map: Mapping[str, int] = field(default_factory=dict)
     """Speaker -> id"""
 
+    emotion_id_map: Mapping[str, int] = field(default_factory=dict)  # NEW
+    """Emotion -> id"""
+
     piper_version: Optional[str] = None
 
     # Inference settings
@@ -49,6 +52,11 @@ class PiperConfig:
     noise_w_scale: float = DEFAULT_NOISE_W_SCALE
 
     hop_length: int = DEFAULT_HOP_LENGTH
+
+    @property
+    def num_emotions(self) -> int:  # NEW
+        """Number of emotions."""
+        return len(self.emotion_id_map) if self.emotion_id_map else 0
 
     @staticmethod
     def from_dict(config: dict[str, Any]) -> "PiperConfig":
@@ -67,6 +75,7 @@ class PiperConfig:
             phoneme_id_map=config["phoneme_id_map"],
             phoneme_type=PhonemeType(config.get("phoneme_type", PhonemeType.ESPEAK)),
             speaker_id_map=config.get("speaker_id_map", {}),
+            emotion_id_map=config.get("emotion_id_map", {}),  # NEW
             #
             piper_version=config.get("piper_version"),
             #
@@ -92,6 +101,7 @@ class PiperConfig:
             },
             "phoneme_id_map": self.phoneme_id_map,
             "speaker_id_map": self.speaker_id_map,
+            "emotion_id_map": self.emotion_id_map,  # NEW
             "hop_length": self.hop_length,
         }
 
@@ -107,6 +117,9 @@ class SynthesisConfig:
 
     speaker_id: Optional[int] = None
     """Index of speaker to use (multi-speaker voices only)."""
+
+    emotion_id: Optional[int] = None  # NEW
+    """Index of emotion to use (multi-emotion voices only)."""
 
     length_scale: Optional[float] = None
     """Phoneme length scale (< 1 is faster, > 1 is slower)."""

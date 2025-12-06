@@ -543,7 +543,9 @@ class SynthesizerTrn(nn.Module):
         upsample_initial_channel: int,
         upsample_kernel_sizes: typing.Tuple[int, ...],
         n_speakers: int = 1,
+        n_emotions: int = 0,  # NEW: number of emotion categories
         gin_channels: int = 0,
+        emo_channels: int = 0,  # NEW: emotion embedding channels
         use_sdp: bool = True,
     ):
 
@@ -565,7 +567,16 @@ class SynthesizerTrn(nn.Module):
         self.upsample_kernel_sizes = upsample_kernel_sizes
         self.segment_size = segment_size
         self.n_speakers = n_speakers
-        self.gin_channels = gin_channels
+        self.n_emotions = n_emotions  # NEW
+        self.emo_channels = emo_channels  # NEW
+
+        # Calculate total conditioning channels
+        # Speaker embedding uses gin_channels, emotion uses emo_channels
+        # Combined conditioning = gin_channels + emo_channels (when both present)
+        total_cond_channels = gin_channels
+        if n_emotions > 1 and emo_channels > 0:
+            total_cond_channels = gin_channels + emo_channels
+        self.gin_channels = total_cond_channels
 
         self.use_sdp = use_sdp
 
@@ -587,7 +598,7 @@ class SynthesizerTrn(nn.Module):
             upsample_rates,
             upsample_initial_channel,
             upsample_kernel_sizes,
-            gin_channels=gin_channels,
+            gin_channels=total_cond_channels,
         )
         self.enc_q = PosteriorEncoder(
             spec_channels,
@@ -596,33 +607,59 @@ class SynthesizerTrn(nn.Module):
             5,
             1,
             16,
-            gin_channels=gin_channels,
+            gin_channels=total_cond_channels,
         )
         self.flow = ResidualCouplingBlock(
-            inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels
+            inter_channels, hidden_channels, 5, 1, 4, gin_channels=total_cond_channels
         )
 
         if use_sdp:
             self.dp = StochasticDurationPredictor(
-                hidden_channels, 192, 3, 0.5, 4, gin_channels=gin_channels
+                hidden_channels, 192, 3, 0.5, 4, gin_channels=total_cond_channels
             )
         else:
             self.dp = DurationPredictor(
-                hidden_channels, 256, 3, 0.5, gin_channels=gin_channels
+                hidden_channels, 256, 3, 0.5, gin_channels=total_cond_channels
             )
 
+        # Speaker embedding
         if n_speakers > 1:
             self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
-    def forward(self, x, x_lengths, y, y_lengths, sid=None):
+        # NEW: Emotion embedding
+        if n_emotions > 1:
+            self.emb_e = nn.Embedding(n_emotions, emo_channels)
+
+    def _get_conditioning(
+        self,
+        sid: typing.Optional[torch.Tensor] = None,
+        eid: typing.Optional[torch.Tensor] = None,
+    ) -> typing.Optional[torch.Tensor]:
+        """Combine speaker and emotion embeddings into conditioning vector."""
+        g = None
+
+        # Speaker embedding
+        if self.n_speakers > 1 and sid is not None:
+            g = self.emb_g(sid).unsqueeze(-1)  # [b, gin_channels, 1]
+
+        # Emotion embedding
+        if self.n_emotions > 1 and eid is not None:
+            e = self.emb_e(eid).unsqueeze(-1)  # [b, emo_channels, 1]
+            if g is not None:
+                g = torch.cat([g, e], dim=1)  # [b, gin_channels + emo_channels, 1]
+            else:
+                g = e
+
+        return g
+
+    def forward(self, x, x_lengths, y, y_lengths, sid=None, eid=None):
         # Import here so we can avoid building the module for inference only
         from . import monotonic_align
 
         x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
-        if self.n_speakers > 1:
-            g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
-        else:
-            g = None
+
+        # Get combined speaker + emotion conditioning
+        g = self._get_conditioning(sid, eid)
 
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
         z_p = self.flow(z, y_mask, g=g)
@@ -685,17 +722,22 @@ class SynthesizerTrn(nn.Module):
         x,
         x_lengths,
         sid=None,
+        eid=None,  # NEW: emotion id
         noise_scale=0.667,
         length_scale=1,
         noise_scale_w=0.8,
         max_len=None,
     ):
         x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
+
+        # Validate required IDs
         if self.n_speakers > 1:
             assert sid is not None, "Missing speaker id"
-            g = self.emb_g(sid).unsqueeze(-1)  # [b, h, 1]
-        else:
-            g = None
+        if self.n_emotions > 1:
+            assert eid is not None, "Missing emotion id"
+
+        # Get combined speaker + emotion conditioning
+        g = self._get_conditioning(sid, eid)
 
         if self.use_sdp:
             logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)

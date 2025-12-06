@@ -19,7 +19,14 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 from piper.config import PhonemeType, PiperConfig
 from piper.phoneme_ids import DEFAULT_PHONEME_ID_MAP, phonemes_to_ids
-from piper.phonemize_espeak import EspeakPhonemizer
+
+# Try to use C extension first, fall back to subprocess-based phonemizer
+try:
+    from piper import espeakbridge  # Test if C extension is available
+    from piper.phonemize_espeak import EspeakPhonemizer
+except ImportError:
+    logging.getLogger(__name__).info("espeakbridge not available, using subprocess-based phonemizer")
+    from piper.phonemize_espeak_subprocess import EspeakPhonemizer
 
 from .mel_processing import spectrogram_torch
 from .utils import get_cache_id
@@ -35,6 +42,7 @@ class CachedUtterance:
     audio_spec_path: Path
     text: Optional[str] = None
     speaker_id: Optional[int] = None
+    emotion_id: Optional[int] = None  # NEW
 
 
 class VitsDataModule(L.LightningDataModule):
@@ -50,6 +58,7 @@ class VitsDataModule(L.LightningDataModule):
         alignments_dir: Optional[Union[str, Path]] = None,
         num_symbols: int = 256,
         num_speakers: int = 1,
+        num_emotions: int = 0,  # NEW: number of emotion categories (0 = disabled)
         batch_size: int = 32,
         validation_split: float = 0.1,
         num_test_examples: int = 5,
@@ -73,6 +82,7 @@ class VitsDataModule(L.LightningDataModule):
         self.sample_rate = sample_rate
         self.num_symbols = num_symbols
         self.num_speakers = num_speakers
+        self.num_emotions = num_emotions  # NEW
 
         if audio_dir is not None:
             self.audio_dir = Path(audio_dir)
@@ -103,6 +113,7 @@ class VitsDataModule(L.LightningDataModule):
 
         self.piper_config: Optional[PiperConfig] = None
         self.is_multispeaker = self.num_speakers > 1
+        self.is_multiemotion = self.num_emotions > 1  # NEW
 
     def prepare_data(self):
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -118,20 +129,45 @@ class VitsDataModule(L.LightningDataModule):
         )
 
         speaker_id_map: Dict[str, int] = {}
-        if self.is_multispeaker:
-            # Generate speaker id map
-            with open(self.csv_path, "r", encoding="utf-8") as csv_file:
-                reader = csv.reader(csv_file, delimiter="|")
-                for row in reader:
+        emotion_id_map: Dict[str, int] = {}  # NEW
+
+        # First pass: build speaker and emotion maps
+        with open(self.csv_path, "r", encoding="utf-8") as csv_file:
+            reader = csv.reader(csv_file, delimiter="|")
+            for row in reader:
+                # CSV formats:
+                # Single speaker, no emotion: wav|text
+                # Single speaker + emotion: wav|emotion|text
+                # Multi-speaker, no emotion: wav|speaker|text
+                # Multi-speaker + emotion: wav|speaker|emotion|text
+
+                if self.is_multispeaker:
                     assert (
                         len(row) >= 3
                     ), "Expected CSV columns for multi-speaker metadata: wav|speaker|text"
                     speaker_name = row[1]
-                    if speaker_name in speaker_id_map:
-                        continue
+                    if speaker_name not in speaker_id_map:
+                        speaker_id_map[speaker_name] = len(speaker_id_map)
 
-                    speaker_id_map[speaker_name] = len(speaker_id_map)
+                    # NEW: Parse emotion for multi-speaker
+                    if self.is_multiemotion:
+                        assert (
+                            len(row) >= 4
+                        ), "Expected CSV columns for multi-speaker+emotion: wav|speaker|emotion|text"
+                        emotion_name = row[2]
+                        if emotion_name not in emotion_id_map:
+                            emotion_id_map[emotion_name] = len(emotion_id_map)
 
+                elif self.is_multiemotion:
+                    # NEW: Single speaker + emotion
+                    assert (
+                        len(row) >= 3
+                    ), "Expected CSV columns for emotion metadata: wav|emotion|text"
+                    emotion_name = row[1]
+                    if emotion_name not in emotion_id_map:
+                        emotion_id_map[emotion_name] = len(emotion_id_map)
+
+        if self.is_multispeaker:
             assert (
                 len(speaker_id_map) <= self.num_speakers
             ), "More speakers in metadata than num_speakers"
@@ -144,6 +180,22 @@ class VitsDataModule(L.LightningDataModule):
                 )
 
             self.piper_config.speaker_id_map = speaker_id_map
+
+        # NEW: Validate and store emotion map
+        if self.is_multiemotion:
+            assert (
+                len(emotion_id_map) <= self.num_emotions
+            ), "More emotions in metadata than num_emotions"
+
+            if len(emotion_id_map) != self.num_emotions:
+                _LOGGER.warning(
+                    "Expected %s emotions in the dataset, got %s",
+                    self.num_emotions,
+                    len(emotion_id_map),
+                )
+
+            self.piper_config.emotion_id_map = emotion_id_map
+            _LOGGER.info("Emotion ID map: %s", emotion_id_map)
 
         # Write config
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -165,12 +217,24 @@ class VitsDataModule(L.LightningDataModule):
             for row_number, row in enumerate(reader, start=1):
                 utt_id, text = row[0], row[-1]
                 speaker_id: Optional[int] = None
+                emotion_id: Optional[int] = None  # NEW
+
                 if self.is_multispeaker:
                     assert (
                         len(row) >= 3
                     ), "Expected CSV columns for multi-speaker metadata: wav|speaker|text"
                     speaker_name = row[1]
                     speaker_id = speaker_id_map[speaker_name]
+
+                    # NEW: Parse emotion for multi-speaker
+                    if self.is_multiemotion:
+                        emotion_name = row[2]
+                        emotion_id = emotion_id_map[emotion_name]
+
+                elif self.is_multiemotion:
+                    # NEW: Single speaker + emotion
+                    emotion_name = row[1]
+                    emotion_id = emotion_id_map[emotion_name]
 
                 audio_path = self.audio_dir / utt_id
                 if not audio_path.exists():
@@ -278,18 +342,31 @@ class VitsDataModule(L.LightningDataModule):
 
         all_utts: list[CachedUtterance] = []
         speaker_id_map = self.piper_config.speaker_id_map
+        emotion_id_map = getattr(self.piper_config, 'emotion_id_map', None)  # NEW
 
         with open(self.csv_path, "r", encoding="utf-8") as csv_file:
             reader = csv.reader(csv_file, delimiter="|")
             for row_number, row in enumerate(reader, start=1):
                 utt_id, text = row[0], row[-1]
                 speaker_id: Optional[int] = None
+                emotion_id: Optional[int] = None  # NEW
+
                 if self.is_multispeaker:
                     assert (
                         len(row) >= 3
                     ), "Expected CSV columns for multi-speaker metadata: wav|speaker|text"
                     speaker_name = row[1]
                     speaker_id = speaker_id_map[speaker_name]
+
+                    # NEW: Parse emotion for multi-speaker
+                    if self.is_multiemotion and emotion_id_map:
+                        emotion_name = row[2]
+                        emotion_id = emotion_id_map[emotion_name]
+
+                elif self.is_multiemotion and emotion_id_map:
+                    # NEW: Single speaker + emotion
+                    emotion_name = row[1]
+                    emotion_id = emotion_id_map[emotion_name]
 
                 audio_path = self.audio_dir / utt_id
                 if not audio_path.exists():
@@ -340,6 +417,7 @@ class VitsDataModule(L.LightningDataModule):
                         audio_spec_path=audio_spec_path,
                         text=text,
                         speaker_id=speaker_id,
+                        emotion_id=emotion_id,  # NEW
                     )
                 )
 
@@ -355,7 +433,9 @@ class VitsDataModule(L.LightningDataModule):
         return DataLoader(
             self.train_dataset,
             collate_fn=UtteranceCollate(
-                is_multispeaker=(self.num_speakers > 1), segment_size=self.segment_size
+                is_multispeaker=(self.num_speakers > 1),
+                is_multiemotion=self.is_multiemotion,  # NEW
+                segment_size=self.segment_size,
             ),
             batch_size=self.batch_size,
             num_workers=self.num_workers,
@@ -365,7 +445,9 @@ class VitsDataModule(L.LightningDataModule):
         return DataLoader(
             self.test_dataset,
             collate_fn=UtteranceCollate(
-                is_multispeaker=(self.num_speakers > 1), segment_size=self.segment_size
+                is_multispeaker=(self.num_speakers > 1),
+                is_multiemotion=self.is_multiemotion,  # NEW
+                segment_size=self.segment_size,
             ),
             batch_size=self.batch_size,
             num_workers=self.num_workers,
@@ -375,7 +457,9 @@ class VitsDataModule(L.LightningDataModule):
         return DataLoader(
             self.val_dataset,
             collate_fn=UtteranceCollate(
-                is_multispeaker=(self.num_speakers > 1), segment_size=self.segment_size
+                is_multispeaker=(self.num_speakers > 1),
+                is_multiemotion=self.is_multiemotion,  # NEW
+                segment_size=self.segment_size,
             ),
             batch_size=self.batch_size,
             num_workers=self.num_workers,
@@ -446,6 +530,7 @@ class UtteranceTensors:
     spectrogram: FloatTensor
     audio_norm: FloatTensor
     speaker_id: Optional[LongTensor] = None
+    emotion_id: Optional[LongTensor] = None  # NEW
     text: Optional[str] = None
 
     @property
@@ -462,6 +547,7 @@ class Batch:
     audios: FloatTensor
     audio_lengths: LongTensor
     speaker_ids: Optional[LongTensor] = None
+    emotion_ids: Optional[LongTensor] = None  # NEW
 
 
 class VitsDataset(Dataset):
@@ -480,13 +566,17 @@ class VitsDataset(Dataset):
             speaker_id=(
                 LongTensor([utt.speaker_id]) if utt.speaker_id is not None else None
             ),
+            emotion_id=(  # NEW
+                LongTensor([utt.emotion_id]) if utt.emotion_id is not None else None
+            ),
             text=utt.text,
         )
 
 
 class UtteranceCollate:
-    def __init__(self, is_multispeaker: bool, segment_size: int):
+    def __init__(self, is_multispeaker: bool, is_multiemotion: bool, segment_size: int):
         self.is_multispeaker = is_multispeaker
+        self.is_multiemotion = is_multiemotion  # NEW
         self.segment_size = segment_size
 
     def __call__(self, utterances: Sequence[UtteranceTensors]) -> Batch:
@@ -515,6 +605,8 @@ class UtteranceCollate:
             num_mels = utt.spectrogram.size(0)
             if self.is_multispeaker:
                 assert utt.speaker_id is not None, "Missing speaker id"
+            if self.is_multiemotion:  # NEW
+                assert utt.emotion_id is not None, "Missing emotion id"
 
         # Audio cannot be smaller than segment size (8192)
         max_audio_length = max(max_audio_length, self.segment_size)
@@ -535,6 +627,11 @@ class UtteranceCollate:
         speaker_ids: Optional[LongTensor] = None
         if self.is_multispeaker:
             speaker_ids = LongTensor(num_utterances)
+
+        # NEW: Emotion IDs
+        emotion_ids: Optional[LongTensor] = None
+        if self.is_multiemotion:
+            emotion_ids = LongTensor(num_utterances)
 
         # Sort by decreasing spectrogram length
         sorted_utterances = sorted(
@@ -559,6 +656,11 @@ class UtteranceCollate:
                 assert speaker_ids is not None
                 speaker_ids[utt_idx] = utt.speaker_id
 
+            # NEW: Handle emotion_id
+            if utt.emotion_id is not None:
+                assert emotion_ids is not None
+                emotion_ids[utt_idx] = utt.emotion_id
+
         return Batch(
             phoneme_ids=phonemes_padded,
             phoneme_lengths=phoneme_lengths,
@@ -567,4 +669,5 @@ class UtteranceCollate:
             audios=audio_padded,
             audio_lengths=audio_lengths,
             speaker_ids=speaker_ids,
+            emotion_ids=emotion_ids,  # NEW
         )

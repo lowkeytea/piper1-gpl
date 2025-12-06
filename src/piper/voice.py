@@ -17,7 +17,15 @@ import onnxruntime
 from .config import PhonemeType, PiperConfig, SynthesisConfig
 from .const import BOS, EOS, PAD
 from .phoneme_ids import phonemes_to_ids
-from .phonemize_espeak import ESPEAK_DATA_DIR, EspeakPhonemizer
+# Try to use C extension phonemizer first, fall back to subprocess-based
+try:
+    from . import espeakbridge  # Test if C extension is available
+    from .phonemize_espeak import ESPEAK_DATA_DIR, EspeakPhonemizer
+except ImportError:
+    # Fallback to subprocess-based phonemizer
+    from .phonemize_espeak_subprocess import EspeakPhonemizer
+    from pathlib import Path as _Path
+    ESPEAK_DATA_DIR = _Path(__file__).parent / "espeak-ng-data"
 from .tashkeel import TashkeelDiacritizer
 
 _ESPEAK_PHONEMIZER: Optional[EspeakPhonemizer] = None
@@ -452,6 +460,19 @@ class PiperVoice:
         if speaker_id is not None:
             sid = np.array([speaker_id], dtype=np.int64)
             args["sid"] = sid
+
+        # Emotion ID
+        emotion_id = syn_config.emotion_id
+        if self.config.num_emotions <= 1:
+            emotion_id = None
+
+        if (self.config.num_emotions > 1) and (emotion_id is None):
+            # Default emotion
+            emotion_id = 0
+
+        if emotion_id is not None:
+            eid = np.array([emotion_id], dtype=np.int64)
+            args["eid"] = eid
 
         # Synthesize through onnx
         result = self.session.run(

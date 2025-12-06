@@ -54,7 +54,7 @@ def main() -> None:
     with torch.no_grad():
         model_g.dec.remove_weight_norm()
 
-    def infer_forward(text, text_lengths, scales, sid=None):
+    def infer_forward(text, text_lengths, scales, sid=None, eid=None):  # NEW: added eid
         noise_scale = scales[0]
         length_scale = scales[1]
         noise_scale_w = scales[2]
@@ -65,6 +65,7 @@ def main() -> None:
             length_scale=length_scale,
             noise_scale_w=noise_scale_w,
             sid=sid,
+            eid=eid,  # NEW
         )[0].unsqueeze(1)
 
         return audio
@@ -73,6 +74,7 @@ def main() -> None:
 
     num_symbols = model_g.n_vocab
     num_speakers = model_g.n_speakers
+    num_emotions = model_g.n_emotions  # NEW
 
     dummy_input_length = 50
     sequences = torch.randint(
@@ -84,9 +86,17 @@ def main() -> None:
     if num_speakers > 1:
         sid = torch.LongTensor([0])
 
+    # NEW: Emotion ID
+    eid: Optional[torch.LongTensor] = None
+    if num_emotions > 1:
+        eid = torch.LongTensor([0])
+
     # noise, length, noise_w
     scales = torch.FloatTensor([0.667, 1.0, 0.8])
-    dummy_input = (sequences, sequence_lengths, scales, sid)
+    dummy_input = (sequences, sequence_lengths, scales, sid, eid)  # NEW: added eid
+
+    # NEW: Build input names list dynamically
+    input_names = ["input", "input_lengths", "scales", "sid", "eid"]
 
     # Export
     torch.onnx.export(
@@ -95,7 +105,7 @@ def main() -> None:
         f=output_path,
         verbose=False,
         opset_version=OPSET_VERSION,
-        input_names=["input", "input_lengths", "scales", "sid"],
+        input_names=input_names,  # NEW: use dynamic list
         output_names=["output"],
         dynamic_axes={
             "input": {0: "batch_size", 1: "phonemes"},
@@ -104,6 +114,10 @@ def main() -> None:
         },
     )
     _LOGGER.info("Exported model to %s", output_path)
+    _LOGGER.info(
+        "Model info: %d symbols, %d speakers, %d emotions",
+        num_symbols, num_speakers, num_emotions
+    )  # NEW: log emotion count
 
 
 # -----------------------------------------------------------------------------
