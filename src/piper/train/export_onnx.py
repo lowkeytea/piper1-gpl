@@ -54,49 +54,70 @@ def main() -> None:
     with torch.no_grad():
         model_g.dec.remove_weight_norm()
 
-    def infer_forward(text, text_lengths, scales, sid=None, eid=None):  # NEW: added eid
-        noise_scale = scales[0]
-        length_scale = scales[1]
-        noise_scale_w = scales[2]
-        audio = model_g.infer(
-            text,
-            text_lengths,
-            noise_scale=noise_scale,
-            length_scale=length_scale,
-            noise_scale_w=noise_scale_w,
-            sid=sid,
-            eid=eid,  # NEW
-        )[0].unsqueeze(1)
+    num_symbols = model_g.n_vocab
+    num_speakers = model_g.n_speakers
+    num_emotions = model_g.n_emotions
 
-        return audio
+    has_speakers = num_speakers > 1
+    has_emotions = num_emotions > 1
+
+    # Build forward wrapper with correct signature based on model config
+    # ONNX tracing requires positional args, so we can't use **kwargs
+    if has_speakers and has_emotions:
+        def infer_forward(text, text_lengths, scales, sid, eid):
+            audio = model_g.infer(
+                text, text_lengths,
+                noise_scale=scales[0], length_scale=scales[1], noise_scale_w=scales[2],
+                sid=sid, eid=eid,
+            )[0].unsqueeze(1)
+            return audio
+    elif has_speakers:
+        def infer_forward(text, text_lengths, scales, sid):
+            audio = model_g.infer(
+                text, text_lengths,
+                noise_scale=scales[0], length_scale=scales[1], noise_scale_w=scales[2],
+                sid=sid,
+            )[0].unsqueeze(1)
+            return audio
+    elif has_emotions:
+        def infer_forward(text, text_lengths, scales, eid):
+            audio = model_g.infer(
+                text, text_lengths,
+                noise_scale=scales[0], length_scale=scales[1], noise_scale_w=scales[2],
+                eid=eid,
+            )[0].unsqueeze(1)
+            return audio
+    else:
+        def infer_forward(text, text_lengths, scales):
+            audio = model_g.infer(
+                text, text_lengths,
+                noise_scale=scales[0], length_scale=scales[1], noise_scale_w=scales[2],
+            )[0].unsqueeze(1)
+            return audio
 
     model_g.forward = infer_forward  # type: ignore[method-assign,assignment]
 
-    num_symbols = model_g.n_vocab
-    num_speakers = model_g.n_speakers
-    num_emotions = model_g.n_emotions  # NEW
-
+    # Build dummy inputs
     dummy_input_length = 50
     sequences = torch.randint(
         low=0, high=num_symbols, size=(1, dummy_input_length), dtype=torch.long
     )
     sequence_lengths = torch.LongTensor([sequences.size(1)])
-
-    sid: Optional[torch.LongTensor] = None
-    if num_speakers > 1:
-        sid = torch.LongTensor([0])
-
-    # NEW: Emotion ID
-    eid: Optional[torch.LongTensor] = None
-    if num_emotions > 1:
-        eid = torch.LongTensor([0])
-
-    # noise, length, noise_w
     scales = torch.FloatTensor([0.667, 1.0, 0.8])
-    dummy_input = (sequences, sequence_lengths, scales, sid, eid)  # NEW: added eid
 
-    # NEW: Build input names list dynamically
-    input_names = ["input", "input_lengths", "scales", "sid", "eid"]
+    # Build input list and names based on model config
+    dummy_input_list = [sequences, sequence_lengths, scales]
+    input_names = ["input", "input_lengths", "scales"]
+
+    if has_speakers:
+        dummy_input_list.append(torch.LongTensor([0]))
+        input_names.append("sid")
+
+    if has_emotions:
+        dummy_input_list.append(torch.LongTensor([0]))
+        input_names.append("eid")
+
+    dummy_input = tuple(dummy_input_list)
 
     # Export
     torch.onnx.export(
