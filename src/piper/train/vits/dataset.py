@@ -13,7 +13,10 @@ import librosa
 import lightning as L
 import numpy as np
 import torch
-from pysilero_vad import SileroVoiceActivityDetector
+try:
+    from pysilero_vad import SileroVoiceActivityDetector
+except ModuleNotFoundError:  # pragma: no cover
+    SileroVoiceActivityDetector = None  # type: ignore[assignment]
 from torch import FloatTensor, LongTensor
 from torch.utils.data import DataLoader, Dataset, random_split
 
@@ -208,7 +211,14 @@ class VitsDataModule(L.LightningDataModule):
             )
 
         phonemizer = EspeakPhonemizer()
-        vad = SileroVoiceActivityDetector()
+        vad = None
+        if self.trim_silence:
+            if SileroVoiceActivityDetector is None:
+                raise ModuleNotFoundError(
+                    "trim_silence=True requires pysilero-vad. "
+                    "Install `pysilero-vad` or set trim_silence=false."
+                )
+            vad = SileroVoiceActivityDetector()
 
         num_utterances = 0
         report_prepare: Optional[bool] = None
@@ -493,7 +503,13 @@ class VitsDataModule(L.LightningDataModule):
                 # Can't process
                 continue
 
-            prob = vad.process_array(chunk)
+            # pysilero-vad API changed across versions; support both.
+            if hasattr(vad, "process_array"):
+                prob = vad.process_array(chunk)  # type: ignore[attr-defined]
+            elif hasattr(vad, "process_samples"):
+                prob = vad.process_samples(chunk.tolist())  # type: ignore[attr-defined]
+            else:
+                prob = vad.process_chunk(chunk.astype(np.float32).tobytes())  # type: ignore[attr-defined]
             is_speech = prob >= threshold
 
             if is_speech:

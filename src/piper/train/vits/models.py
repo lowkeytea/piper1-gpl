@@ -522,6 +522,14 @@ class MultiPeriodDiscriminator(torch.nn.Module):
 class SynthesizerTrn(nn.Module):
     """
     Synthesizer for Training
+
+    Supports three speaker conditioning modes:
+    1. Speaker ID embedding (n_speakers > 1): Traditional lookup table
+    2. External speaker embedding (use_external_speaker_emb=True): Zero-shot cloning
+    3. Both: Can switch between modes at inference time
+
+    For zero-shot voice cloning, set use_external_speaker_emb=True and pass
+    speaker embeddings via the `g` parameter in forward/infer methods.
     """
 
     def __init__(
@@ -547,6 +555,7 @@ class SynthesizerTrn(nn.Module):
         gin_channels: int = 0,
         emo_channels: int = 0,  # NEW: emotion embedding channels
         use_sdp: bool = True,
+        use_external_speaker_emb: bool = False,  # Enable external speaker embedding
     ):
 
         super().__init__()
@@ -569,6 +578,7 @@ class SynthesizerTrn(nn.Module):
         self.n_speakers = n_speakers
         self.n_emotions = n_emotions  # NEW
         self.emo_channels = emo_channels  # NEW
+        self.use_external_speaker_emb = use_external_speaker_emb
 
         # Calculate total conditioning channels
         # Speaker embedding uses gin_channels, emotion uses emo_channels
@@ -634,15 +644,36 @@ class SynthesizerTrn(nn.Module):
         self,
         sid: typing.Optional[torch.Tensor] = None,
         eid: typing.Optional[torch.Tensor] = None,
+        g_external: typing.Optional[torch.Tensor] = None,
     ) -> typing.Optional[torch.Tensor]:
-        """Combine speaker and emotion embeddings into conditioning vector."""
+        """
+        Combine speaker and emotion embeddings into conditioning vector.
+
+        Args:
+            sid: Speaker ID tensor [batch] for embedding lookup
+            eid: Emotion ID tensor [batch] for embedding lookup
+            g_external: External speaker embedding [batch, gin_channels, 1]
+                       from speaker encoder (for zero-shot cloning)
+
+        Returns:
+            Combined conditioning tensor [batch, total_cond_channels, 1] or None
+
+        Priority:
+            1. If g_external provided, use it as speaker conditioning
+            2. Otherwise, use speaker embedding lookup (if n_speakers > 1)
+            3. Emotion embedding is always added if n_emotions > 1
+        """
         g = None
 
-        # Speaker embedding
-        if self.n_speakers > 1 and sid is not None:
+        # Speaker conditioning: external embedding takes priority over ID lookup
+        if g_external is not None:
+            # External speaker embedding from speaker encoder
+            g = g_external  # [b, gin_channels, 1]
+        elif self.n_speakers > 1 and sid is not None:
+            # Traditional speaker ID embedding lookup
             g = self.emb_g(sid).unsqueeze(-1)  # [b, gin_channels, 1]
 
-        # Emotion embedding
+        # Emotion embedding (always added if enabled)
         if self.n_emotions > 1 and eid is not None:
             e = self.emb_e(eid).unsqueeze(-1)  # [b, emo_channels, 1]
             if g is not None:
@@ -652,14 +683,39 @@ class SynthesizerTrn(nn.Module):
 
         return g
 
-    def forward(self, x, x_lengths, y, y_lengths, sid=None, eid=None):
+    def forward(
+        self,
+        x,
+        x_lengths,
+        y,
+        y_lengths,
+        sid=None,
+        eid=None,
+        g_external=None,
+    ):
+        """
+        Forward pass for training.
+
+        Args:
+            x: Phoneme sequences [batch, text_len]
+            x_lengths: Text lengths [batch]
+            y: Mel spectrograms [batch, n_mels, mel_len]
+            y_lengths: Mel lengths [batch]
+            sid: Speaker IDs [batch] (for embedding lookup)
+            eid: Emotion IDs [batch] (for embedding lookup)
+            g_external: External speaker embedding [batch, gin_channels, 1]
+                       from speaker encoder (for zero-shot cloning)
+
+        Returns:
+            Tuple of (output, duration_loss, attention, ids_slice, masks, latents)
+        """
         # Import here so we can avoid building the module for inference only
         from . import monotonic_align
 
         x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
 
         # Get combined speaker + emotion conditioning
-        g = self._get_conditioning(sid, eid)
+        g = self._get_conditioning(sid, eid, g_external)
 
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
         z_p = self.flow(z, y_mask, g=g)
@@ -723,21 +779,40 @@ class SynthesizerTrn(nn.Module):
         x_lengths,
         sid=None,
         eid=None,  # NEW: emotion id
+        g_external=None,  # External speaker embedding for zero-shot
         noise_scale=0.667,
         length_scale=1,
         noise_scale_w=0.8,
         max_len=None,
     ):
+        """
+        Inference (synthesis) from text.
+
+        Args:
+            x: Phoneme sequences [batch, text_len]
+            x_lengths: Text lengths [batch]
+            sid: Speaker IDs [batch] (for embedding lookup, ignored if g_external)
+            eid: Emotion IDs [batch] (for embedding lookup)
+            g_external: External speaker embedding [batch, gin_channels, 1]
+                       from speaker encoder (for zero-shot cloning)
+            noise_scale: Noise scale for sampling
+            length_scale: Duration scale factor
+            noise_scale_w: Noise scale for duration predictor
+            max_len: Maximum output length
+
+        Returns:
+            Tuple of (audio, attention, y_mask, latents)
+        """
         x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
 
-        # Validate required IDs
-        if self.n_speakers > 1:
-            assert sid is not None, "Missing speaker id"
+        # Validate required IDs (external embedding bypasses speaker ID requirement)
+        if self.n_speakers > 1 and g_external is None:
+            assert sid is not None, "Missing speaker id (or provide g_external)"
         if self.n_emotions > 1:
             assert eid is not None, "Missing emotion id"
 
         # Get combined speaker + emotion conditioning
-        g = self._get_conditioning(sid, eid)
+        g = self._get_conditioning(sid, eid, g_external)
 
         if self.use_sdp:
             logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
@@ -765,10 +840,43 @@ class SynthesizerTrn(nn.Module):
 
         return o, attn, y_mask, (z, z_p, m_p, logs_p)
 
-    def voice_conversion(self, y, y_lengths, sid_src, sid_tgt):
-        assert self.n_speakers > 1, "n_speakers have to be larger than 1."
-        g_src = self.emb_g(sid_src).unsqueeze(-1)
-        g_tgt = self.emb_g(sid_tgt).unsqueeze(-1)
+    def voice_conversion(
+        self,
+        y,
+        y_lengths,
+        sid_src=None,
+        sid_tgt=None,
+        g_src=None,
+        g_tgt=None,
+    ):
+        """
+        Voice conversion from source to target speaker.
+
+        Can use either speaker IDs (for lookup) or external embeddings.
+
+        Args:
+            y: Source mel spectrogram [batch, n_mels, mel_len]
+            y_lengths: Mel lengths [batch]
+            sid_src: Source speaker ID [batch] (for embedding lookup)
+            sid_tgt: Target speaker ID [batch] (for embedding lookup)
+            g_src: External source speaker embedding [batch, gin_channels, 1]
+            g_tgt: External target speaker embedding [batch, gin_channels, 1]
+
+        Returns:
+            Tuple of (converted_audio, y_mask, latents)
+        """
+        # Get source conditioning
+        if g_src is None:
+            assert self.n_speakers > 1, "n_speakers > 1 required for ID-based VC"
+            assert sid_src is not None, "Need sid_src or g_src"
+            g_src = self.emb_g(sid_src).unsqueeze(-1)
+
+        # Get target conditioning
+        if g_tgt is None:
+            assert self.n_speakers > 1, "n_speakers > 1 required for ID-based VC"
+            assert sid_tgt is not None, "Need sid_tgt or g_tgt"
+            g_tgt = self.emb_g(sid_tgt).unsqueeze(-1)
+
         z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g_src)
         z_p = self.flow(z, y_mask, g=g_src)
         z_hat = self.flow(z_p, y_mask, g=g_tgt, reverse=True)
